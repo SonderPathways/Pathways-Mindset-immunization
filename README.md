@@ -1,4 +1,4 @@
-# Pathways-Mindset-immunization
+# Pathways & Mindset: Zero-dose vulnerability analysis
 Analysis of Pathways segmentation in the Mindset dataset to support the Gates Immunization team. 
 
 ## Timeline
