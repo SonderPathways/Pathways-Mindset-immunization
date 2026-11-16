@@ -58,7 +58,7 @@ rm(list=ls())
 
 Load packages
 ```{r,echo=FALSE}
-pacman::p_load("dplyr","rpart", "rpart.plot", "caret", "randomForest", "data.table", "ggplot2", "gplots", "tidyverse", "readxl","corrplot", "ggplot2", "ranger", "haven", "readstata13")
+pacman::p_load("dplyr","rpart", "rpart.plot", "caret", "randomForest", "data.table", "ggplot2", "gplots", "tidyverse", "readxl","corrplot", "ggplot2", "ranger", "haven", "readstata13","purrr","furrr")
 ```
 
 Read in mapped segmentation and Mindset datasets
@@ -319,6 +319,190 @@ confusionMatrix(data=PredictCART_train_rural.kano, as.factor(rural.kano$segment_
 
 prp(tree_rural.kano_prune, type=5, varlen=0, cex=1)
 #fancyRpartPlot(tree_urban_prune, type = 3, cex = 0.7, caption = NULL, uniform=T)
+```
+
+#### 2.2.4. Final Optimized CART Model - Urban
+
+```{r}
+urban$segment_rank <- factor(urban$segment_rank)
+lv <- levels(urban$segment_rank)
+K  <- length(lv)
+
+fml <- segment_rank ~ hh.toilet.flush + med.dist + tv.yn + muslim + roof + hh.mobile +
+  any.media.yn + hh.noimp.housing + ed.sec.higher + hh.noimp.wall + marr.cohab +
+  partner.working.yn + working.yn + hh.clean.fuel + med.cost + med.permis + med.alone +
+  religion + newsp.yn + rad.yn + has.mobile + floor + any.hh.dis + hh.rooms.cat +
+  hh.land + hh.animal
+
+# Loss matrix: rows = TRUE class, cols = PREDICTED class.
+# w[i] = cost of misclassifying a true class-i case.
+make_loss <- function(w) { L <- matrix(w, K, K); diag(L) <- 0; L }
+
+# ---- Training-set performance for one loss setting, across all cp values ----
+train_by_loss <- function(w1, w2, w3, w4) {
+  w   <- c(w1, w2, w3, w4)
+  set.seed(2026)
+  fit <- rpart(fml, data = urban, method = "class",
+               parms   = list(loss = make_loss(w)),
+               control = rpart.control(cp = 0.001, xval = 5))
+  
+  cps <- fit$cptable[, "CP"]
+  
+  map_dfr(seq_along(cps), function(j) {
+    pruned <- prune(fit, cp = cps[j])
+    pred   <- predict(pruned, newdata = urban, type = "class")
+    cm     <- confusionMatrix(pred, urban$segment_rank)
+    s      <- cm$byClass[, "Sensitivity"]
+    sp     <- cm$byClass[, "Specificity"]
+    tibble(weights      = paste(w, collapse = "/"),
+           cp           = cps[j],
+           n_leaves     = fit$cptable[j, "nsplit"] + 1,
+           xerror       = round(fit$cptable[j, "xerror"], 3),
+           !!!setNames(as.list(round(s,  3)), paste0("sens_", lv)),
+           !!!setNames(as.list(round(sp, 3)), paste0("spec_", lv)),
+           min_sens     = round(min(s), 3),
+           mean_bal_acc = round(mean(cm$byClass[, "Balanced Accuracy"]), 3),
+           accuracy     = round(unname(cm$overall["Accuracy"]), 3))
+  })
+}
+
+# ---- Grid of class weights ----
+
+weight_grid <- expand_grid(
+  w1 = seq(.5, 2, by = 0.25),   
+  w2 = seq(0.5, 2, by = 0.25),   
+  w3 = 1,
+  w4 = seq(.5, 2, by = 0.25)
+)
+nrow(weight_grid)   
+
+# parallel compute
+plan(multisession, workers = max(1, parallel::detectCores() - 1))
+
+results <- future_pmap_dfr(
+  weight_grid, train_by_loss,
+  .options  = furrr_options(seed = TRUE,
+                            packages = c("rpart", "caret", "dplyr", "purrr", "tibble")),
+  .progress = TRUE
+)
+plan(sequential)
+
+
+# Settings where every class is >= 80% sensitive:
+# smallest tree first, then best balanced accuracy
+best <- results %>%
+  filter(min_sens >= 0.80) %>%
+  arrange(n_leaves, desc(mean_bal_acc))
+best %>% print(n = 20, width = Inf)
+
+# ---- Refit and prune the chosen model ----
+pick <- best[12, ]
+w    <- as.numeric(strsplit(pick$weights, "/")[[1]])
+
+tree_final <- rpart(fml, data = urban, method = "class",
+                    parms   = list(loss = make_loss(w)),
+                    control = rpart.control(cp = 0.001, xval = 5))
+tree_final <- prune(tree_final, cp = pick$cp)
+
+confusionMatrix(predict(tree_final, newdata = urban, type = "class"),
+                urban$segment_rank)
+
+prp(tree_final, type = 5, varlen = 0, cex = .5)
+
+saveRDS(tree_final, "tree_urban_pruned_mk.rds")
+
+```
+
+#### 2.2.5. Final Optimized CART Model - Rural
+
+```{r} 
+rural$segment_rank <- factor(rural$segment_rank)
+lv <- levels(rural$segment_rank)
+K  <- length(lv)
+
+fml <- segment_rank ~ hh.toilet.flush + med.dist + tv.yn + muslim + roof + hh.mobile + 
+  any.media.yn + hh.noimp.housing + ed.level + hh.noimp.wall + marr.cohab + partner.working.yn + 
+  working.yn + hh.clean.fuel + med.cost + med.permis + med.alone + religion + newsp.yn + rad.yn + 
+  has.mobile + floor + any.hh.dis + hh.rooms.cat + hh.land + hh.animal
+
+# Loss matrix: rows = TRUE class, cols = PREDICTED class.
+# w[i] = cost of misclassifying a true class-i case.
+make_loss <- function(w) { L <- matrix(w, K, K); diag(L) <- 0; L }
+
+# ---- Training-set performance for one loss setting, across all cp values ----
+train_by_loss <- function(w1, w2, w3, w4, w5) {
+  w   <- c(w1, w2, w3, w4, w5)
+  set.seed(2026)
+  fit <- rpart(fml, data = rural, method = "class",
+               parms   = list(loss = make_loss(w)),
+               control = rpart.control(cp = 0.001, xval = 5))
+  
+  cps <- fit$cptable[, "CP"]
+  
+  map_dfr(seq_along(cps), function(j) {
+    pruned <- prune(fit, cp = cps[j])
+    pred   <- predict(pruned, newdata = rural, type = "class")
+    cm     <- confusionMatrix(pred, rural$segment_rank)
+    s      <- cm$byClass[, "Sensitivity"]
+    sp     <- cm$byClass[, "Specificity"]
+    tibble(weights      = paste(w, collapse = "/"),
+           cp           = cps[j],
+           n_leaves     = fit$cptable[j, "nsplit"] + 1,
+           xerror       = round(fit$cptable[j, "xerror"], 3),
+           !!!setNames(as.list(round(s,  3)), paste0("sens_", lv)),
+           !!!setNames(as.list(round(sp, 3)), paste0("spec_", lv)),
+           min_sens     = round(min(s), 3),
+           mean_bal_acc = round(mean(cm$byClass[, "Balanced Accuracy"]), 3),
+           accuracy     = round(unname(cm$overall["Accuracy"]), 3))
+  })
+}
+
+# ---- Grid of class weights ----
+
+weight_grid <- expand_grid(
+  w1 = seq(1, 2,   by = 0.25),    
+  w2 = seq(1, 2,   by = 0.25),   
+  w3 = 1,
+  w4 = seq(1, 2,   by = 0.25),   
+  w5 = seq(0.25, 2, by = 0.25)   
+)
+nrow(weight_grid)   
+
+
+plan(multisession, workers = max(1, parallel::detectCores() - 1))
+
+results <- future_pmap_dfr(
+  weight_grid, train_by_loss,
+  .options  = furrr_options(seed = TRUE,
+                            packages = c("rpart", "caret", "dplyr", "purrr", "tibble")),
+  .progress = TRUE
+)
+plan(sequential)
+
+
+# Settings where every class is >= 779% sensitive:
+# smallest tree first, then best balanced accuracy
+best <- results %>%
+  filter(min_sens >= 0.779) %>%
+  arrange(n_leaves, desc(mean_bal_acc))
+best %>% print(n = 30, width = Inf)
+
+# ---- Refit and prune the chosen model ----
+pick <- best[3, ]
+w    <- as.numeric(strsplit(pick$weights, "/")[[1]])
+
+tree_final <- rpart(fml, data = rural, method = "class",
+                    parms   = list(loss = make_loss(w)),
+                    control = rpart.control(cp = 0.001, xval = 5))
+tree_final <- prune(tree_final, cp = pick$cp)
+
+confusionMatrix(predict(tree_final, newdata = rural, type = "class"),
+                rural$segment_rank)
+
+prp(tree_final, type = 5, varlen = 0, cex = .5)
+
+saveRDS(tree_final, "tree_rural_pruned_mk.rds")
+
 ```
 
 ## 3. Try other methods 
