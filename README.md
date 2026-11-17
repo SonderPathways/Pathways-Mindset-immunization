@@ -2,8 +2,7 @@
 Analysis of Pathways segmentation in the Mindset dataset to support the Gates Immunization team. 
 
 ## Timeline
-- Contingent on data sharing agreement from Kano
-- Approx timeline to complete work: 2 months
+- To be completed by end of Dec 2026
 
 
 ## Final Deliverables
