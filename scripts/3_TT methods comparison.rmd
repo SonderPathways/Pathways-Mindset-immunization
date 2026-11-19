@@ -329,9 +329,9 @@ lv <- levels(urban$segment_rank)
 K  <- length(lv)
 
 fml <- segment_rank ~ hh.toilet.flush + med.dist + tv.yn + muslim + roof + hh.mobile +
-  any.media.yn + hh.noimp.housing + ed.sec.higher + hh.noimp.wall + marr.cohab +
+   hh.noimp.housing + ed.sec.higher + hh.noimp.wall + marr.cohab +
   partner.working.yn + working.yn + hh.clean.fuel + med.cost + med.permis + med.alone +
-  religion + newsp.yn + rad.yn + has.mobile + floor + any.hh.dis + hh.rooms.cat +
+  religion + rad.yn + has.mobile + floor + any.hh.dis + hh.rooms.cat +
   hh.land + hh.animal
 
 # Loss matrix: rows = TRUE class, cols = PREDICTED class.
@@ -396,7 +396,7 @@ best <- results %>%
 best %>% print(n = 20, width = Inf)
 
 # ---- Refit and prune the chosen model ----
-pick <- best[12, ]
+pick <- best[1, ]
 w    <- as.numeric(strsplit(pick$weights, "/")[[1]])
 
 tree_final <- rpart(fml, data = urban, method = "class",
@@ -409,7 +409,7 @@ confusionMatrix(predict(tree_final, newdata = urban, type = "class"),
 
 prp(tree_final, type = 5, varlen = 0, cex = .5)
 
-saveRDS(tree_final, "tree_urban_pruned_mk.rds")
+saveRDS(tree_final, "../data/tree_urban_pruned_mk.rds")
 
 ```
 
@@ -421,8 +421,8 @@ lv <- levels(rural$segment_rank)
 K  <- length(lv)
 
 fml <- segment_rank ~ hh.toilet.flush + med.dist + tv.yn + muslim + roof + hh.mobile + 
-  any.media.yn + hh.noimp.housing + ed.level + hh.noimp.wall + marr.cohab + partner.working.yn + 
-  working.yn + hh.clean.fuel + med.cost + med.permis + med.alone + religion + newsp.yn + rad.yn + 
+  hh.noimp.housing + ed.level + hh.noimp.wall + marr.cohab + partner.working.yn + 
+  working.yn + hh.clean.fuel + med.cost + med.permis + med.alone + religion + rad.yn + 
   has.mobile + floor + any.hh.dis + hh.rooms.cat + hh.land + hh.animal
 
 # Loss matrix: rows = TRUE class, cols = PREDICTED class.
@@ -501,7 +501,7 @@ confusionMatrix(predict(tree_final, newdata = rural, type = "class"),
 
 prp(tree_final, type = 5, varlen = 0, cex = .5)
 
-saveRDS(tree_final, "tree_rural_pruned_mk.rds")
+saveRDS(tree_final, "../data/tree_rural_pruned_mk.rds")
 
 ```
 
@@ -661,7 +661,7 @@ plot(varImp(rf_cv_rural), top = 15)
 # Using the model in prediction mode for new data
 rural_pred <- predict(rf_cv_rural, newdata = rf_data[, predictors])
 
-saveRDS(rf_cv_rural, "random_forest_rural_national.rds")
+saveRDS(rf_cv_rural, "../data/random_forest_rural_national.rds")
 ```
 
 #### 3.1.2. Urban National
@@ -808,7 +808,7 @@ plot(varImp(rf_cv_urban), top = 15)
 # Using the model in prediction mode for new data
 urban_pred <- predict(rf_cv_urban, newdata = rf_data[, predictors])
 
-saveRDS(rf_cv_urban, "random_forest_urban_national.rds")
+saveRDS(rf_cv_urban, "../data/random_forest_urban_national.rds")
 
 ```
 
