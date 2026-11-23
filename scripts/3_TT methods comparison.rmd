@@ -51,9 +51,6 @@ Set up filepath, notation and packages
 knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
 options(scipen = 100, digits = 4)
 rm(list=ls())
-# knitr::opts_knit$set(
-#   root.dir = "/Users/sophie/Documents/consultancy/sonder/projects/Mindset_Immunization copy"
-# )
 ```
 
 Load packages
@@ -151,188 +148,335 @@ rural$segment_rank <- as.factor(rural$segment_rank)
 rural.kano$segment_rank <- as.factor(rural.kano$segment_rank)
 ```
 
-### 2.1. Urban tree
-#### 2.1.1. National
+### 2.1. CART models - with Test and Train approach
+#### 2.1.1. Define Functions
 ```{r}
-tree_urban <- rpart(segment_rank ~ any.hh.dis + ed.sec.higher + has.mobile + hh.animal + hh.clean.fuel + hh.land + hh.noimp.housing + hh.noimp.wall + hh.rooms.cat + hh.toilet.flush + marr.cohab + med.alone + med.cost + med.dist + med.permis + muslim + occupation.cat1 + partner.working.yn + rad.yn + tv.yn + wealth.sum.index.cat1 + working.yn, data=urban, control=rpart.control(cp=0.001, xval=5), method="class")
+# Loss matrix: rows = TRUE class, cols = PREDICTED class.
+# w[i] = cost of misclassifying a true class-i case.
+make_loss <- function(w) {
+  L <- matrix(w, length(w), length(w))
+  diag(L) <- 0
+  L
+}
 
-plotcp(tree_urban)
-printcp(tree_urban)
+# Per-class sensitivity/specificity + summary metrics, as a one-row tibble
+class_metrics <- function(pred, truth, prefix = "") {
+  lvl <- levels(truth)
+  cm  <- confusionMatrix(factor(pred, levels = lvl), truth)
+  s   <- cm$byClass[, "Sensitivity"]
+  sp  <- cm$byClass[, "Specificity"]
+  out <- c(setNames(s,  paste0("sens_", lvl)),
+           setNames(sp, paste0("spec_", lvl)),
+           min_sens     = min(s),
+           mean_bal_acc = mean(cm$byClass[, "Balanced Accuracy"]),
+           accuracy     = unname(cm$overall["Accuracy"]))
+  as_tibble(as.list(round(out, 3))) %>% rename_with(~ paste0(prefix, .x))
+}
+
+# Stratified train/test split
+# Stratified train/test split (text columns converted to factors first,
+# so rare categories are known to the model even if absent from train)
+split_data <- function(data, outcome, p = 0.8, seed = 2026) {
+  data <- data %>% mutate(across(where(is.character), factor))
+  set.seed(seed)
+  idx <- createDataPartition(data[[outcome]], p = p, list = FALSE)
+  list(train = data[idx, ], test = data[-idx, ])
+}
+
+# One weight setting: grow the tree on TRAIN, score every cp on TRAIN only
+tune_one <- function(w, fml, train) {
+  y <- train[[all.vars(fml)[1]]]
+  set.seed(2026)
+  fit <- rpart(fml, data = train, method = "class",
+               parms   = list(loss = make_loss(w)),
+               control = rpart.control(cp = 0.001, xval = 5))
+  cps <- fit$cptable[, "CP"]
+  
+  map_dfr(seq_along(cps), function(j) {
+    pruned <- prune(fit, cp = cps[j])
+    bind_cols(
+      tibble(weights  = paste(w, collapse = "/"),
+             cp       = cps[j],
+             n_leaves = fit$cptable[j, "nsplit"] + 1,
+             xerror   = round(fit$cptable[j, "xerror"], 3)),
+      class_metrics(predict(pruned, newdata = train, type = "class"), y)
+    )
+  })
+}
+
+# Run the whole weight grid in parallel
+run_grid <- function(weight_grid, fml, train) {
+  plan(multisession, workers = max(1, parallel::detectCores() - 1))
+  on.exit(plan(sequential))
+  future_map_dfr(
+    seq_len(nrow(weight_grid)),
+    function(i) tune_one(unlist(weight_grid[i, ]), fml, train),
+    .options  = furrr_options(seed = TRUE,
+                              packages = c("rpart", "caret", "dplyr", "purrr", "tibble")),
+    .progress = TRUE
+  )
+}
+
+# Refit the chosen setting on TRAIN and prune
+fit_final <- function(pick, fml, train) {
+  w <- as.numeric(strsplit(pick$weights, "/")[[1]])
+  set.seed(2026)
+  fit <- rpart(fml, data = train, method = "class",
+               parms   = list(loss = make_loss(w)),
+               control = rpart.control(cp = 0.001, xval = 5))
+  prune(fit, cp = pick$cp)
+}
+
+# Side-by-side train vs test performance for the final tree
+compare_train_test <- function(tree, fml, train, test) {
+  y_name <- all.vars(fml)[1]
+  bind_rows(
+    class_metrics(predict(tree, newdata = train, type = "class"), train[[y_name]]) %>%
+      mutate(set = "train", n = nrow(train)),
+    class_metrics(predict(tree, newdata = test,  type = "class"), test[[y_name]]) %>%
+      mutate(set = "test",  n = nrow(test))
+  ) %>% relocate(set, n)
+}
 ```
-
+#### 2.1.2 National Urban
 ```{r}
-tree_urban_prune<-prune(tree_urban, cp=0.001)
+# --- predictors
+
+fml_urban <- segment_rank ~ hh.toilet.flush + med.dist + tv.yn + muslim + roof + has.mobile +
+  hh.noimp.housing + ed.sec.higher + hh.noimp.wall + marr.cohab +
+  hh.clean.fuel + med.cost + med.permis + med.alone +
+  religion + rad.yn + floor + any.hh.dis + hh.rooms.cat +
+  hh.land + hh.animal + working.yn
+
+# ---- 80/20 stratified split ----
+urban_split <- split_data(urban, "segment_rank", p = 0.8)
+urban_train <- urban_split$train
+urban_test  <- urban_split$test
+table(train = urban_train$segment_rank)
+table(test  = urban_test$segment_rank)
+
+# ---- Grid of class weights (one weight per level, in level order) ----
+levels(urban$segment_rank)
+weight_grid_urban <- expand_grid(
+  w1 = seq(0.25, 2, by = 0.25),
+  w2 = seq(0.25, 2, by = 0.25),
+  w3 = 1,
+  w4 = seq(0.25, 2, by = 0.25)
+)
+nrow(weight_grid_urban)
+
+# ---- Search on the TRAINING set only ----
+results_urban <- run_grid(weight_grid_urban, fml_urban, urban_train)
+
+best_urban <- results_urban %>%
+  filter(min_sens >= 0.80) %>%
+  arrange(n_leaves, desc(mean_bal_acc))
+best_urban %>% print(n = 20, width = Inf)
+
+# ---- Refit the chosen model on TRAIN ----
+pick_urban <- best_urban[14, ]          # select the row number after reviewing the table
+tree_urban_final <- fit_final(pick_urban, fml_urban, urban_train)
+
+# ---- Performance: training vs held-out test ----
+df_compare <- compare_train_test(tree_urban_final, fml_urban, urban_train, urban_test) %>%
+  print(width = Inf)
+
+# Full confusion matrices
+confusionMatrix(predict(tree_urban_final, newdata = urban_train, type = "class"),
+                urban_train$segment_rank)
+confusionMatrix(predict(tree_urban_final, newdata = urban_test,  type = "class"),
+                urban_test$segment_rank)
+
+prp(tree_urban_final, type = 5, varlen = 0, cex = .5)
+
+saveRDS(tree_urban_final, "national_urban_tree_train_test.rds")
+write.csv(df_compare,"national_urban_tree_train_test_performance.csv", row.names = FALSE)
 ```
 
-```{r, fig.height=10, fig.width= 18}
-# Look at sensitivity/specificity/etc for pruned tree
-PredictCART_train_urban <- predict(tree_urban_prune, data=urban, type="class")
-confusionMatrix(data=PredictCART_train_urban, as.factor(urban$segment_rank))
-
-prp(tree_urban_prune, type=5, varlen=0, cex=1)
-#fancyRpartPlot(tree_urban_prune, type = 3, cex = 0.7, caption = NULL, uniform=T)
-```
-
-#### 2.1.2. National with penalty
-```{r}
-#  Grow a tree with loss penalty for U2-NN
-cls <- levels(urban$segment_rank)
-K   <- length(cls)
-
-loss <- matrix(1, nrow = K, ncol = K, dimnames = list(cls, cls))
-diag(loss) <- 0
-loss["U2-NN", ] <- 1.1   # stronger penalty for harder segment
-loss["U2-NN", "U2-NN"] <- 0
-
-tree_urban <- rpart(segment_rank ~ any.hh.dis + ed.sec.higher + has.mobile + hh.animal + hh.clean.fuel + hh.land + hh.noimp.housing + hh.noimp.wall + hh.rooms.cat + hh.toilet.flush + marr.cohab + med.alone + med.cost + med.dist + med.permis + muslim + occupation.cat1 + partner.working.yn + rad.yn + tv.yn + wealth.sum.index.cat1 + working.yn, data=urban, parms = list(loss = loss), control=rpart.control(cp=0.001, xval=5), method="class")
-plotcp(tree_urban)
-printcp(tree_urban)
-# See what is the cp value if following 1-SE rule 
-cp_table <- as.data.frame(tree_urban$cptable)
-# minimum xerror row
-min_row <- which.min(cp_table$xerror)
-# threshold = min xerror + its standard error
-threshold <- cp_table$xerror[min_row] + cp_table$xstd[min_row]
-
-# pick the LARGEST cp (= simplest tree) whose xerror is still within threshold
-cp_1se <- cp_table$CP[max(which(cp_table$xerror <= threshold))]
-
-cat("cp chosen by 1-SE rule:", cp_1se, "\n")
-cat("cp chosen by min-xerror:", cp_table$CP[min_row], "\n")
-#both suggesting 0.001; but then the tree is unnecessarily big, and the line starts flattened from0.02, so adjust it to 0.002)
-tree_urban_prune <- prune(tree_urban, cp = 0.002)
-```
-
-```{r, fig.height=12, fig.width=20}
-prp(tree_urban_prune, type=5, varlen=0, cex=0.9, extra = 2)
-
-pred <- predict(tree_urban_prune, urban, type = "class")
-confusionMatrix(pred, urban$segment_rank)
-```
-
-#### 2.1.3. Kano only (difficult for small-sized class 3)
-```{r}
-tree_urban.kano <- rpart(segment_rank ~ any.hh.dis + ed.sec.higher + has.mobile + hh.animal + hh.clean.fuel + hh.land + hh.noimp.housing + hh.noimp.wall + hh.rooms.cat + hh.toilet.flush + marr.cohab + med.alone + med.cost + med.dist + med.permis + muslim + occupation.cat1 + partner.working.yn + rad.yn + tv.yn + wealth.sum.index.cat1 + working.yn, data=urban.kano, control=rpart.control(cp=0.001, xval=5), method="class")
-
-plotcp(tree_urban.kano)
-printcp(tree_urban.kano)
-```
-
-```{r}
-table(urban.kano$segment_rank) #there are only 23 obs. for U3.2; and U3.1 has only 28 obs. but this is the not partnered segment (so easy to get sensitivity = 1).
-```
-
-```{r}
-tree_urban.kano_prune<-prune(tree_urban.kano, cp=0.001)
-```
-
-```{r, fig.height=10, fig.width= 18}
-# Look at sensitivity/specificity/etc for pruned tree
-PredictCART_train_urban.kano <- predict(tree_urban.kano_prune, data=urban.kano, type="class")
-confusionMatrix(data=PredictCART_train_urban.kano, as.factor(urban.kano$segment_rank))
-
-prp(tree_urban.kano_prune, type=5, varlen=0, cex=1)
-#fancyRpartPlot(tree_urban_prune, type = 3, cex = 0.7, caption = NULL, uniform=T)
-```
-
-### 2.2. Rural tree
-#### 2.2.1. National
-```{r}
-tree_rural <- rpart(segment_rank ~ any.hh.dis + ed.level + hh.mobile + hh.animal + hh.clean.fuel + hh.land + hh.noimp.housing + hh.noimp.wall + hh.rooms.cat + hh.toilet.flush + marr.cohab + med.alone + med.cost + med.dist + med.permis + muslim + religion + occupation.cat1 + partner.working.yn + rad.yn + tv.yn + wealth.sum.index.cat1 + working.yn, data=rural, control=rpart.control(cp=0.001, xval=5), method="class")
-
-plotcp(tree_rural)
-printcp(tree_rural)
-```
-
-```{r}
-tree_rural_prune<-prune(tree_rural, cp=0.001)
-```
-
-```{r, fig.height=10, fig.width= 18}
-# Look at sensitivity/specificity/etc for pruned tree
-PredictCART_train_rural <- predict(tree_rural_prune, data=rural, type="class")
-confusionMatrix(data=PredictCART_train_rural, as.factor(rural$segment_rank))
-
-prp(tree_rural_prune, type=5, varlen=0, cex=1)
-#fancyRpartPlot(tree_urban_prune, type = 3, cex = 0.7, caption = NULL, uniform=T)
-```
-
-#### 2.2.2. National with penalty (not better, sacrifice R2)
-```{r}
-#  Grow a tree with loss penalty for R3.1 and R4.1 
-cls <- levels(rural$segment_rank)
-K   <- length(cls)
-
-loss <- matrix(1, nrow = K, ncol = K, dimnames = list(cls, cls))
-diag(loss) <- 0
-loss["R3.1-NN", ] <- 1.6   # stronger penalty for harder segment
-loss["R3.1-NN", "R3.1-NN"] <- 0
-loss["R4.1-NN",   ] <- 1.4
-loss["R4.1-NN",   "R4.1-NN"]   <- 0
-
-tree_rural <- rpart(segment_rank ~ any.hh.dis + ed.level + hh.mobile + hh.animal + hh.clean.fuel + hh.land + hh.noimp.housing + hh.noimp.wall + hh.rooms.cat + hh.toilet.flush + marr.cohab + med.alone + med.cost + med.dist + med.permis + muslim + religion + occupation.cat1 + partner.working.yn + rad.yn + tv.yn + wealth.sum.index.cat1 + working.yn, data=rural, parms = list(loss = loss), control=rpart.control(cp=0.001, xval=5), method="class")
-plotcp(tree_rural)
-printcp(tree_rural)
-# See what is the cp value if following 1-SE rule 
-cp_table <- as.data.frame(tree_rural$cptable)
-# minimum xerror row
-min_row <- which.min(cp_table$xerror)
-# threshold = min xerror + its standard error
-threshold <- cp_table$xerror[min_row] + cp_table$xstd[min_row]
-
-# pick the LARGEST cp (= simplest tree) whose xerror is still within threshold
-cp_1se <- cp_table$CP[max(which(cp_table$xerror <= threshold))]
-
-cat("cp chosen by 1-SE rule:", cp_1se, "\n")
-cat("cp chosen by min-xerror:", cp_table$CP[min_row], "\n")
-#both suggesting 0.001, 0.0012 (earlier when penalizing, we use the xerror: tree_loss$cptable[which.min(tree_loss$cptable[, "xerror"]), "CP"], it also indicates 0.001; but then the tree is still big, so adjust it to 0.0015)
-tree_rural_prune <- prune(tree_rural, cp = 0.00126)
-```
-
-```{r, fig.height=12, fig.width=20}
-prp(tree_rural_prune, type=5, varlen=0, cex=0.9, extra = 2)
-
-pred <- predict(tree_rural_prune, rural, type = "class")
-confusionMatrix(pred, rural$segment_rank)
-```
-
-#### 2.2.3. Kano only
-```{r}
-table(rural.kano$segment_rank) # R3.1 has only 34 obs.
-```
+#### 2.1.3 National Rural
 
 ```{r}
-tree_rural.kano <- rpart(segment_rank ~ any.hh.dis + ed.level + hh.mobile + hh.animal + hh.clean.fuel + hh.land + hh.noimp.housing + hh.noimp.wall + hh.rooms.cat + hh.toilet.flush + marr.cohab + med.alone + med.cost + med.dist + med.permis + muslim + religion + occupation.cat1 + partner.working.yn + rad.yn + tv.yn + wealth.sum.index.cat1 + working.yn, data=rural.kano, control=rpart.control(cp=0.001, xval=5), method="class")
 
-plotcp(tree_rural.kano)
-printcp(tree_rural.kano)
+fml_rural <- segment_rank ~ hh.toilet.flush + med.dist + tv.yn + muslim + roof + has.mobile +
+  hh.noimp.housing + ed.level + hh.noimp.wall + marr.cohab  + hh.clean.fuel + med.cost + med.permis +      
+  med.alone + religion + rad.yn + floor + any.hh.dis + hh.rooms.cat + hh.land + hh.animal + working.yn
+
+# ---- 80/20 stratified split ----
+rural_split <- split_data(rural, "segment_rank", p = 0.8)
+rural_train <- rural_split$train
+rural_test  <- rural_split$test
+table(train = rural_train$segment_rank)
+table(test  = rural_test$segment_rank)
+
+# ---- Grid of class weights (one weight per level, in level order) ----
+levels(rural$segment_rank)
+weight_grid_rural <- expand_grid(
+  w1 = seq(.25,    2, by = 0.25),
+  w2 = seq(.25,    2, by = 0.25),
+  w3 = 1,
+  w4 = seq(.25,    2, by = 0.25),
+  w5 = seq(0.25, 2, by = 0.25)
+)
+nrow(weight_grid_rural)
+
+# ---- Search on the TRAINING set only ----
+results_rural <- run_grid(weight_grid_rural, fml_rural, rural_train)
+
+best_rural <- results_rural %>%
+  filter(min_sens >= 0.77) %>%
+  arrange(n_leaves, desc(mean_bal_acc))
+best_rural %>% print(n = 30, width = Inf)
+
+# ---- Refit the chosen model on TRAIN ----
+pick_rural <- best_rural[1, ]          # change the row number after reviewing the table
+tree_rural_final <- fit_final(pick_rural, fml_rural, rural_train)
+
+# ---- Performance: training vs held-out test ----
+df_compare <- compare_train_test(tree_rural_final, fml_rural, rural_train, rural_test) %>%
+  print(width = Inf)
+
+# Full confusion matrices
+confusionMatrix(predict(tree_rural_final, newdata = rural_train, type = "class"),
+                rural_train$segment_rank)
+confusionMatrix(predict(tree_rural_final, newdata = rural_test,  type = "class"),
+                rural_test$segment_rank)
+
+prp(tree_rural_final, type = 5, varlen = 0, cex = .5)
+
+
+saveRDS(tree_rural_final, "national_rural_tree_train_test.rds")
+write.csv(df_compare,"national_rural_tree_train_test_performance.csv", row.names = FALSE)
 ```
+
+#### 2.1.4 National Urban Kano Only
+```{r}
+# --- predictors
+fml_urban <- segment_rank ~ hh.toilet.flush + med.dist + tv.yn + muslim + roof +
+  hh.noimp.housing + ed.sec.higher + hh.noimp.wall + marr.cohab +
+  hh.clean.fuel + med.cost + med.permis + med.alone +
+  religion + rad.yn + has.mobile + floor + any.hh.dis + hh.rooms.cat +
+  hh.land + hh.animal + working.yn
+
+# ---- 80/20 stratified split ----
+urban_split <- split_data(urban.kano, "segment_rank", p = 0.8)
+urban_train <- urban_split$train
+urban_test  <- urban_split$test
+table(train = urban_train$segment_rank)
+table(test  = urban_test$segment_rank)
+
+# ---- Grid of class weights (one weight per level, in level order) ----
+levels(urban$segment_rank)
+weight_grid_urban <- expand_grid(
+  w1 = seq(0.25, 2, by = 0.25),
+  w2 = seq(0.25, 2, by = 0.25),
+  w3 = 1,
+  w4 = seq(0.25, 2, by = 0.25)
+)
+nrow(weight_grid_urban)
+
+# ---- Search on the TRAINING set only ----
+results_urban <- run_grid(weight_grid_urban, fml_urban, urban_train)
+
+best_urban <- results_urban %>%
+  filter(min_sens >= 0.78) %>%
+  arrange(n_leaves, desc(mean_bal_acc))
+best_urban %>% print(n = 20, width = Inf)
+
+# ---- Refit the chosen model on TRAIN ----
+pick_urban <- best_urban[8, ]          # change the row number after reviewing the table
+tree_urban_final <- fit_final(pick_urban, fml_urban, urban_train)
+
+# ---- Performance: training vs held-out test ----
+df_compare <- compare_train_test(tree_urban_final, fml_urban, urban_train, urban_test) %>%
+  print(width = Inf)
+
+# Full confusion matrices
+confusionMatrix(predict(tree_urban_final, newdata = urban_train, type = "class"),
+                urban_train$segment_rank)
+confusionMatrix(predict(tree_urban_final, newdata = urban_test,  type = "class"),
+                urban_test$segment_rank)
+
+prp(tree_urban_final, type = 5, varlen = 0, cex = .5)
+
+saveRDS(tree_urban_final, "kano_urban_tree_train_test.rds")
+write.csv(df_compare,"kano_urban_tree_train_test_performance.csv", row.names = FALSE)
+
+```
+
+#### 2.1.5 National Rural Kano Only
 
 ```{r}
-tree_rural.kano_prune<-prune(tree_rural.kano, cp=0.025)
+
+# ---- Predictors ----
+fml_rural <- segment_rank ~ hh.toilet.flush + med.dist + tv.yn + muslim + roof + 
+  hh.noimp.housing + ed.level + hh.noimp.wall + marr.cohab + 
+  hh.clean.fuel + med.cost + med.permis + med.alone + religion + rad.yn +
+  has.mobile + floor + any.hh.dis + hh.rooms.cat + hh.land + hh.animal +
+  working.yn
+
+
+# ---- 80/20 stratified split ----
+rural_split <- split_data(rural.kano, "segment_rank", p = 0.8)
+rural_train <- rural_split$train
+rural_test  <- rural_split$test
+table(train = rural_train$segment_rank)
+table(test  = rural_test$segment_rank)
+
+# ---- Grid of class weights (one weight per level, in level order) ----
+levels(rural$segment_rank)
+weight_grid_rural <- expand_grid(
+  w1 = seq(1,    2, by = 0.25),
+  w2 = seq(1,    2, by = 0.25),
+  w3 = 1,
+  w4 = seq(1,    2, by = 0.25),
+  w5 = seq(0.25, 2, by = 0.25)
+)
+nrow(weight_grid_rural)
+
+# ---- Search on the TRAINING set only ----
+results_rural <- run_grid(weight_grid_rural, fml_rural, rural_train)
+
+best_rural <- results_rural %>%
+  filter(min_sens >= 0.71) %>%
+  arrange(n_leaves, desc(mean_bal_acc))
+best_rural %>% print(n = 30, width = Inf)
+
+# ---- Refit the chosen model on TRAIN ----
+pick_rural <- best_rural[1, ]          # change the row number after reviewing the table
+tree_rural_final <- fit_final(pick_rural, fml_rural, rural_train)
+
+# ---- Performance: training vs held-out test ----
+df_compare <- compare_train_test(tree_rural_final, fml_rural, rural_train, rural_test) %>%
+  print(width = Inf)
+
+# Full confusion matrices
+confusionMatrix(predict(tree_rural_final, newdata = rural_train, type = "class"),
+                rural_train$segment_rank)
+confusionMatrix(predict(tree_rural_final, newdata = rural_test,  type = "class"),
+                rural_test$segment_rank)
+
+prp(tree_rural_final, type = 5, varlen = 0, cex = .5)
+
+saveRDS(tree_urban_final, "kano_rural_tree_train_test.rds")
+write.csv(df_compare,"kano_rural_tree_train_test_performance.csv", row.names = FALSE)
+
 ```
 
-```{r, fig.height=10, fig.width= 18}
-# Look at sensitivity/specificity/etc for pruned tree
-PredictCART_train_rural.kano <- predict(tree_rural.kano_prune, data=rural.kano, type="class")
-confusionMatrix(data=PredictCART_train_rural.kano, as.factor(rural.kano$segment_rank))
 
-prp(tree_rural.kano_prune, type=5, varlen=0, cex=1)
-#fancyRpartPlot(tree_urban_prune, type = 3, cex = 0.7, caption = NULL, uniform=T)
-```
+### 2.2 CART models - Model Trained on Full Dataset
 
-#### 2.2.4. Final Optimized CART Model - Urban
 
+#### 2.2.1 National Urban
 ```{r}
-urban$segment_rank <- factor(urban$segment_rank)
+
 lv <- levels(urban$segment_rank)
 K  <- length(lv)
 
-fml <- segment_rank ~ hh.toilet.flush + med.dist + tv.yn + muslim + roof + hh.mobile +
-   hh.noimp.housing + ed.sec.higher + hh.noimp.wall + marr.cohab +
-  partner.working.yn + working.yn + hh.clean.fuel + med.cost + med.permis + med.alone +
-  religion + rad.yn + has.mobile + floor + any.hh.dis + hh.rooms.cat +
-  hh.land + hh.animal
+fml <- segment_rank ~ hh.toilet.flush + med.dist + tv.yn + muslim + roof + has.mobile +
+  hh.noimp.housing + ed.sec.higher + hh.noimp.wall + marr.cohab +
+  hh.clean.fuel + med.cost + med.permis + med.alone +
+  religion + rad.yn + floor + any.hh.dis + hh.rooms.cat +
+  hh.land + hh.animal + working.yn
 
 # Loss matrix: rows = TRUE class, cols = PREDICTED class.
 # w[i] = cost of misclassifying a true class-i case.
@@ -409,21 +553,20 @@ confusionMatrix(predict(tree_final, newdata = urban, type = "class"),
 
 prp(tree_final, type = 5, varlen = 0, cex = .5)
 
-saveRDS(tree_final, "../data/tree_urban_pruned_mk.rds")
+saveRDS(tree_final, "national_urban_tree_all_data.rds")
 
 ```
 
-#### 2.2.5. Final Optimized CART Model - Rural
+#### 2.2.2 National Rural
 
 ```{r} 
-rural$segment_rank <- factor(rural$segment_rank)
+
 lv <- levels(rural$segment_rank)
 K  <- length(lv)
 
-fml <- segment_rank ~ hh.toilet.flush + med.dist + tv.yn + muslim + roof + hh.mobile + 
-  hh.noimp.housing + ed.level + hh.noimp.wall + marr.cohab + partner.working.yn + 
-  working.yn + hh.clean.fuel + med.cost + med.permis + med.alone + religion + rad.yn + 
-  has.mobile + floor + any.hh.dis + hh.rooms.cat + hh.land + hh.animal
+fml <- segment_rank ~ hh.toilet.flush + med.dist + tv.yn + muslim + roof + has.mobile +
+  hh.noimp.housing + ed.level + hh.noimp.wall + marr.cohab  + hh.clean.fuel + med.cost + med.permis +      
+  med.alone + religion + rad.yn + floor + any.hh.dis + hh.rooms.cat + hh.land + hh.animal + working.yn
 
 # Loss matrix: rows = TRUE class, cols = PREDICTED class.
 # w[i] = cost of misclassifying a true class-i case.
@@ -483,7 +626,7 @@ plan(sequential)
 # Settings where every class is >= 779% sensitive:
 # smallest tree first, then best balanced accuracy
 best <- results %>%
-  filter(min_sens >= 0.779) %>%
+  filter(min_sens >= 0.76) %>%
   arrange(n_leaves, desc(mean_bal_acc))
 best %>% print(n = 30, width = Inf)
 
@@ -501,314 +644,193 @@ confusionMatrix(predict(tree_final, newdata = rural, type = "class"),
 
 prp(tree_final, type = 5, varlen = 0, cex = .5)
 
-saveRDS(tree_final, "../data/tree_rural_pruned_mk.rds")
+saveRDS(tree_final, "national_rural_tree_all_data.rds")
 
 ```
 
-## 3. Try other methods 
-### 3.1. Random Forest
-#### 3.1.1. Rural National
+#### 2.2.3 National Urban Kano Only
 ```{r}
 
-################################################################################
-# RANDOM FOREST FOR PREDICTION SEGMENTS
-################################################################################
+lv <- levels(urban.kano$segment_rank)
+K  <- length(lv)
 
-set.seed(123)
+fml <- segment_rank ~ hh.toilet.flush + med.dist + tv.yn + muslim + roof + has.mobile +
+  hh.noimp.housing + ed.sec.higher + hh.noimp.wall + marr.cohab +
+  hh.clean.fuel + med.cost + med.permis + med.alone +
+  religion + rad.yn + floor + any.hh.dis + hh.rooms.cat +
+  hh.land + hh.animal + working.yn
 
-############################ RURAL NATIONAL #############################################
-predictors <- c(
-  "any.hh.dis", "ed.level", "hh.mobile", "hh.animal", "hh.clean.fuel", "hh.land",
-  "hh.noimp.housing", "hh.noimp.wall", "hh.rooms.cat", "hh.toilet.flush",
-  "marr.cohab", "med.alone", "med.cost", "med.dist",
-  "med.permis", "muslim", "religion", "occupation.cat1", "partner.working.yn", 
-  "rad.yn", "tv.yn", "wealth.sum.index.cat1", "working.yn")
+# Loss matrix: rows = TRUE class, cols = PREDICTED class.
+# w[i] = cost of misclassifying a true class-i case.
+make_loss <- function(w) { L <- matrix(w, K, K); diag(L) <- 0; L }
 
-rf_data <- as.data.frame(rural)[, c("segment_rank", predictors), drop = FALSE]
-
-# ---- Data prep ----
-# Outcome must be a factor for classification
-rf_data$segment_rank <- factor(rf_data$segment_rank)
-
-# Character columns -> factors (randomForest won't accept character)
-rf_data[] <- lapply(rf_data, function(x) if (is.character(x)) factor(x) else x)
-
-# randomForest does NOT handle missing values the way rpart does (rpart uses surrogate splits).
-rf_data <- na.roughfix(rf_data)   
-
-# Keep the original labels so you can translate back for reporting
-orig_levels <- levels(rf_data$segment_rank)
-
-# need to change prediction labels for trainControl
-levels(rf_data$segment_rank) <- make.names(orig_levels)
-cls <- levels(rf_data$segment_rank)
-k   <- length(cls)
-
-# Lookup table: safe name -> original label
-label_map <- setNames(orig_levels, cls)
-label_map
-
-# cross validation
-ctrl <- trainControl(
-  method          = "cv",
-  number          = 5,          # 5 folds
-  savePredictions = "final",
-  classProbs      = TRUE
-)
-
-# try a couple of different values for mtry (num of vars picked at each node SQRT(P) is standard for categorical vars)
-p <- length(predictors)
-tune_grid <- expand.grid(mtry = unique(c(2, floor(sqrt(p)), floor(p / 3), floor(p / 2))))
-tune_grid
-
-##################
-# Get best cut off
-####################
-
-# x/y interface keeps factors intact (the formula interface would dummy-code them)
-rf_cv_rural <- train(
-  x          = rf_data[, predictors],
-  y          = rf_data$segment_rank,
-  method     = "rf",
-  trControl  = ctrl,
-  tuneGrid   = tune_grid,
-  ntree      = 500,
-  importance = TRUE,
-  nodesize = 1,
-  metric     = "Kappa",   # or "Kappa", which is better if classes are imbalanced
-)
-
-probs <- as.matrix(rf_cv_rural$pred[, cls])
-obs   <- rf_cv_rural$pred$obs
-
-# Predicted segment for a given set of cutoffs
-predict_cut <- function(cut) {
-  factor(cls[max.col(sweep(probs, 2, cut, "/"), ties.method = "first")], levels = cls)
+# ---- Training-set performance for one loss setting, across all cp values ----
+train_by_loss <- function(w1, w2, w3, w4) {
+  w   <- c(w1, w2, w3, w4)
+  set.seed(2026)
+  fit <- rpart(fml, data = urban.kano, method = "class",
+               parms   = list(loss = make_loss(w)),
+               control = rpart.control(cp = 0.001, xval = 5))
+  
+  cps <- fit$cptable[, "CP"]
+  
+  map_dfr(seq_along(cps), function(j) {
+    pruned <- prune(fit, cp = cps[j])
+    pred   <- predict(pruned, newdata = urban.kano, type = "class")
+    cm     <- confusionMatrix(pred, urban.kano$segment_rank)
+    s      <- cm$byClass[, "Sensitivity"]
+    sp     <- cm$byClass[, "Specificity"]
+    tibble(weights      = paste(w, collapse = "/"),
+           cp           = cps[j],
+           n_leaves     = fit$cptable[j, "nsplit"] + 1,
+           xerror       = round(fit$cptable[j, "xerror"], 3),
+           !!!setNames(as.list(round(s,  3)), paste0("sens_", lv)),
+           !!!setNames(as.list(round(sp, 3)), paste0("spec_", lv)),
+           min_sens     = round(min(s), 3),
+           mean_bal_acc = round(mean(cm$byClass[, "Balanced Accuracy"]), 3),
+           accuracy     = round(unname(cm$overall["Accuracy"]), 3))
+  })
 }
 
-sens_by_class <- function(pred) {
-  diag(prop.table(table(obs, pred), 1))     # sensitivity of each segment
-}
+# ---- Grid of class weights ----
 
-# Multipliers per segment: < 1 = easier to predict, > 1 = harder to predict
-# Segments not listed here (R4.2.NN) stay at 1
-mult_grid <- expand.grid(
-  R3.1.NN = seq(0.4, 1, 0.05),    # weak segment: make easier
-  R4.1.NN = seq(0.4, 1, 0.05),    # weak segment: make easier
-  R2.NN   = seq(0.7, 1, 0.1),     # borderline: optional small adjustment
-  R3.2.NN = c(1, 1.25, 1.5, 2, 3) # perfect segment: make harder
+weight_grid <- expand_grid(
+  w1 = seq(.5, 2, by = 0.25),   
+  w2 = seq(0.5, 2, by = 0.25),   
+  w3 = 1,
+  w4 = seq(.5, 2, by = 0.25)
 )
+nrow(weight_grid)   
 
-results <- do.call(rbind, lapply(seq_len(nrow(mult_grid)), function(i) {
-  cut <- rep(1 / k, k); names(cut) <- cls
-  m   <- unlist(mult_grid[i, ])
-  cut[names(m)] <- cut[names(m)] * m
-  cut <- cut / sum(cut)
-  
-  pred <- predict_cut(cut)
-  s    <- sens_by_class(pred)
-  
-  # people from other segments predicted as R3.2.NN (false positives)
-  fp_R3.2 <- sum(pred == "R3.2.NN" & obs != "R3.2.NN")
-  
-  data.frame(
-    setNames(as.list(m), paste0("m_", names(m))),   # multipliers, prefixed m_
-    as.list(round(s, 3)),                           # sensitivities
-    fp_R3.2   = fp_R3.2,
-    min_sens  = round(min(s), 4),
-    mean_sens = round(mean(s), 4),
-    check.names = FALSE
-  )
-}))
+# parallel compute
+plan(multisession, workers = max(1, parallel::detectCores() - 1))
 
-results <- results[order(-results$min_sens, -results$mean_sens), ]
-head(results, 10)
-
-best <- results[1, grep("^m_", names(results))]
-best_cut <- rep(1 / k, k); names(best_cut) <- cls
-best_cut[sub("^m_", "", names(best))] <- best_cut[sub("^m_", "", names(best))] * unlist(best)
-best_cut <- best_cut / sum(best_cut)
-
-################
-# train model
-################
-
-rf_cv_rural <- train(
-  x          = rf_data[, predictors],
-  y          = rf_data$segment_rank,
-  method     = "rf",
-  trControl  = ctrl,
-  tuneGrid   = tune_grid,
-  ntree      = 500,
-  importance = TRUE,
-  nodesize = 1,
-  metric     = "Kappa",   # or "Kappa", which is better if classes are imbalanced
-  cutoff = best_cut
+results <- future_pmap_dfr(
+  weight_grid, train_by_loss,
+  .options  = furrr_options(seed = TRUE,
+                            packages = c("rpart", "caret", "dplyr", "purrr", "tibble")),
+  .progress = TRUE
 )
+plan(sequential)
 
-print(rf_cv_rural)             # CV accuracy/kappa for each mtry
-plot(rf_cv_rural)
-rf_cv_rural$bestTune           # selected mtry
-rf_cv_rural$finalModel         # final randomForest fit on all data with best mtry
 
-# Cross-validated confusion matrix (from the held-out fold predictions)
-confusionMatrix(rf_cv_rural$pred$pred, rf_cv_rural$pred$obs)
+# Settings where every class is >= 80% sensitive:
+# smallest tree first, then best balanced accuracy
+best <- results %>%
+  filter(min_sens >= 0.79) %>%
+  arrange(n_leaves, desc(mean_bal_acc))
+best %>% print(n = 20, width = Inf)
 
-# Variable importance
-varImp(rf_cv_rural)
-plot(varImp(rf_cv_rural), top = 15)
+# ---- Refit and prune the chosen model ----
+pick <- best[2, ]
+w    <- as.numeric(strsplit(pick$weights, "/")[[1]])
 
-# Using the model in prediction mode for new data
-rural_pred <- predict(rf_cv_rural, newdata = rf_data[, predictors])
+tree_final <- rpart(fml, data = urban.kano, method = "class",
+                    parms   = list(loss = make_loss(w)),
+                    control = rpart.control(cp = 0.001, xval = 5))
+tree_final <- prune(tree_final, cp = pick$cp)
 
-saveRDS(rf_cv_rural, "../data/random_forest_rural_national.rds")
+confusionMatrix(predict(tree_final, newdata = urban.kano, type = "class"),
+                urban.kano$segment_rank)
+
+prp(tree_final, type = 5, varlen = 0, cex = .5)
+
+saveRDS(tree_final, "kano_urban_tree_all_data.rds")
+
 ```
 
-#### 3.1.2. Urban National
-```{r}
-predictors <- c(
-  "any.hh.dis", "ed.sec.higher", "has.mobile", "hh.animal", "hh.clean.fuel", "hh.land",
-  "hh.noimp.housing", "hh.noimp.wall", "hh.rooms.cat", "hh.toilet.flush",
-  "marr.cohab", "med.alone", "med.cost", "med.dist", "med.permis", "muslim", 
-  "occupation.cat1", "partner.working.yn", "rad.yn", "tv.yn",
-  "wealth.sum.index.cat1", "working.yn")
+#### 2.2.4 National Rural Kano Only
 
-rf_data <- as.data.frame(urban)[, c("segment_rank", predictors), drop = FALSE]
+```{r} 
 
-# ---- Data prep ----
-# Outcome must be a factor for classification
-rf_data$segment_rank <- factor(rf_data$segment_rank)
+lv <- levels(rural.kano$segment_rank)
+K  <- length(lv)
 
-# Character columns -> factors (randomForest won't accept character)
-rf_data[] <- lapply(rf_data, function(x) if (is.character(x)) factor(x) else x)
+fml <- segment_rank ~ hh.toilet.flush + med.dist + tv.yn + muslim + roof + has.mobile +
+  hh.noimp.housing + ed.level + hh.noimp.wall + marr.cohab  + hh.clean.fuel + med.cost + med.permis +      
+  med.alone + religion + rad.yn + floor + any.hh.dis + hh.rooms.cat + hh.land + hh.animal + working.yn
 
-# randomForest does NOT handle missing values the way rpart does (rpart uses surrogate splits).
-rf_data <- na.roughfix(rf_data)   
+# Loss matrix: rows = TRUE class, cols = PREDICTED class.
+# w[i] = cost of misclassifying a true class-i case.
+make_loss <- function(w) { L <- matrix(w, K, K); diag(L) <- 0; L }
 
-# Keep the original labels so you can translate back for reporting
-orig_levels <- levels(rf_data$segment_rank)
-
-# need to change prediction labels for trainControl
-levels(rf_data$segment_rank) <- make.names(orig_levels)
-cls <- levels(rf_data$segment_rank)
-k   <- length(cls)
-
-# Lookup table: safe name -> original label
-label_map <- setNames(orig_levels, cls)
-label_map
-
-
-# cross validation
-ctrl <- trainControl(
-  method          = "cv",
-  number          = 5,          # 5 folds
-  savePredictions = "final",
-  classProbs      = TRUE
-)
-
-# try a couple of different values for mtry (num of vars picked at each node SQRT(P) is standard for categorical vars)
-p <- length(predictors)
-tune_grid <- expand.grid(mtry = unique(c(2, floor(sqrt(p)), floor(p / 3), floor(p / 2))))
-tune_grid
-
-
-##################
-# Get best cutoff 
-#################
-
-# x/y interface keeps factors intact (the formula interface would dummy-code them)
-rf_cv_urban <- train(
-  x          = rf_data[, predictors],
-  y          = rf_data$segment_rank,
-  method     = "rf",
-  trControl  = ctrl,
-  tuneGrid   = tune_grid,
-  ntree      = 500,
-  importance = TRUE,
-  nodesize = 1,
-  metric     = "Kappa"  # or "Kappa", which is better if classes are imbalanced
-
-)
-
-cls   <- levels(rf_cv_urban$pred$obs)   # U1.NN, U2.NN, U3.1.NN, U3.2.NN
-k     <- length(cls)
-probs <- as.matrix(rf_cv_urban$pred[, cls])
-obs   <- rf_cv_urban$pred$obs
-
-predict_cut <- function(cut) {
-  factor(cls[max.col(sweep(probs, 2, cut, "/"), ties.method = "first")], levels = cls)
+# ---- Training-set performance for one loss setting, across all cp values ----
+train_by_loss <- function(w1, w2, w3, w4, w5) {
+  w   <- c(w1, w2, w3, w4, w5)
+  set.seed(2026)
+  fit <- rpart(fml, data = rural.kano, method = "class",
+               parms   = list(loss = make_loss(w)),
+               control = rpart.control(cp = 0.001, xval = 5))
+  
+  cps <- fit$cptable[, "CP"]
+  
+  map_dfr(seq_along(cps), function(j) {
+    pruned <- prune(fit, cp = cps[j])
+    pred   <- predict(pruned, newdata = rural.kano, type = "class")
+    cm     <- confusionMatrix(pred, rural.kano$segment_rank)
+    s      <- cm$byClass[, "Sensitivity"]
+    sp     <- cm$byClass[, "Specificity"]
+    tibble(weights      = paste(w, collapse = "/"),
+           cp           = cps[j],
+           n_leaves     = fit$cptable[j, "nsplit"] + 1,
+           xerror       = round(fit$cptable[j, "xerror"], 3),
+           !!!setNames(as.list(round(s,  3)), paste0("sens_", lv)),
+           !!!setNames(as.list(round(sp, 3)), paste0("spec_", lv)),
+           min_sens     = round(min(s), 3),
+           mean_bal_acc = round(mean(cm$byClass[, "Balanced Accuracy"]), 3),
+           accuracy     = round(unname(cm$overall["Accuracy"]), 3))
+  })
 }
 
-sens_by_class <- function(pred) {
-  diag(prop.table(table(obs, pred), 1))     # sensitivity of each segment
-}
+# ---- Grid of class weights ----
 
-# Multipliers per segment: < 1 = easier to predict, > 1 = harder to predict
-# Segments not listed here (U1.NN) stay at 1 as the reference
-mult_grid <- expand.grid(
-  U2.NN   = seq(0.6, 1, 0.05),        # needs a little improvement: make easier
-  U3.2.NN = seq(0.6, 1, 0.05),        # needs a little improvement: make easier
-  U3.1.NN = c(0.9, 1, 1.1, 1.25, 1.5) # can give up some performance if needed
+weight_grid <- expand_grid(
+  w1 = seq(1, 2,   by = 0.25),    
+  w2 = seq(1, 2,   by = 0.25),   
+  w3 = 1,
+  w4 = seq(1, 2,   by = 0.25),   
+  w5 = seq(0.25, 2, by = 0.25)   
 )
+nrow(weight_grid)   
 
-results <- do.call(rbind, lapply(seq_len(nrow(mult_grid)), function(i) {
-  cut <- rep(1 / k, k); names(cut) <- cls
-  m   <- unlist(mult_grid[i, ])
-  cut[names(m)] <- cut[names(m)] * m
-  cut <- cut / sum(cut)
-  
-  s <- sens_by_class(predict_cut(cut))
-  
-  data.frame(
-    setNames(as.list(m), paste0("m_", names(m))),   # multipliers, prefixed m_
-    as.list(round(s, 3)),                           # sensitivities
-    min_sens  = round(min(s), 4),
-    mean_sens = round(mean(s), 4),
-    check.names = FALSE
-  )
-}))
 
-results <- results[order(-results$min_sens, -results$mean_sens), ]
-head(results, 10)
+plan(multisession, workers = max(1, parallel::detectCores() - 1))
 
-best <- results[1, grep("^m_", names(results))]
-best_cut <- rep(1 / k, k); names(best_cut) <- cls
-best_cut[sub("^m_", "", names(best))] <- best_cut[sub("^m_", "", names(best))] * unlist(best)
-best_cut <- best_cut / sum(best_cut)
-round(best_cut, 3)
-
-###############
-# train model
-##############
-rf_cv_urban <- train(
-  x          = rf_data[, predictors],
-  y          = rf_data$segment_rank,
-  method     = "rf",
-  trControl  = ctrl,
-  tuneGrid   = tune_grid,
-  ntree      = 500,
-  importance = TRUE,
-  nodesize = 1,
-  metric     = "Kappa",   # or "Kappa", which is better if classes are imbalanced
-  cutoff = best_cut
+results <- future_pmap_dfr(
+  weight_grid, train_by_loss,
+  .options  = furrr_options(seed = TRUE,
+                            packages = c("rpart", "caret", "dplyr", "purrr", "tibble")),
+  .progress = TRUE
 )
+plan(sequential)
 
-print(rf_cv_urban)             # CV accuracy/kappa for each mtry
-plot(rf_cv_urban)
-rf_cv_urban$bestTune           # selected mtry
-rf_cv_urban$finalModel         # final randomForest fit on all data with best mtry
 
-# Cross-validated confusion matrix (from the held-out fold predictions)
-confusionMatrix(rf_cv_urban$pred$pred, rf_cv_urban$pred$obs)
+# Settings where every class is >= 779% sensitive:
+# smallest tree first, then best balanced accuracy
+best <- results %>%
+  filter(min_sens >= 0.7) %>%
+  arrange(n_leaves, desc(mean_bal_acc))
+best %>% print(n = 30, width = Inf)
 
-# Variable importance
-varImp(rf_cv_urban)
-plot(varImp(rf_cv_urban), top = 15)
+# ---- Refit and prune the chosen model ----
+pick <- best[2, ]
+w    <- as.numeric(strsplit(pick$weights, "/")[[1]])
 
-# Using the model in prediction mode for new data
-urban_pred <- predict(rf_cv_urban, newdata = rf_data[, predictors])
+tree_final <- rpart(fml, data = rural.kano, method = "class",
+                    parms   = list(loss = make_loss(w)),
+                    control = rpart.control(cp = 0.001, xval = 5))
+tree_final <- prune(tree_final, cp = pick$cp)
 
-saveRDS(rf_cv_urban, "../data/random_forest_urban_national.rds")
+confusionMatrix(predict(tree_final, newdata = rural.kano, type = "class"),
+                rural.kano$segment_rank)
+
+prp(tree_final, type = 5, varlen = 0, cex = .5)
+
+saveRDS(tree_final, "kano_rural_tree_all_data.rds")
 
 ```
+
+
+
+
 

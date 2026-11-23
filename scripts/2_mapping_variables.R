@@ -1,5 +1,3 @@
-# remove DK group from ed.level 
-
 #####################################
 # Map Mindset and Pathways variables 
 #####################################
@@ -8,9 +6,7 @@
 
 
 # Variables to determine eligibility/needed for model:
-# urban/rural
-table(MS$area_type, useNA = "ifany") # this looks like the right one to use, but the values are 1/2 and are not labeled 
-table(MS$urban_enum, useNA = "ifany") # this is aligned with the PWS segments (see ptype_rural_* vars) so I think we can use instead
+# urban/rural - use rural.knbs
 
 # ever given birth
 table(MS$given_birth, useNA = "ifany") # assuming 1 = yes, 2 = no
@@ -95,28 +91,14 @@ table(MS$dwelling_roof, useNA ="ifany")
 # recode to match PWS 
 MS <- MS %>%
   mutate(roof = case_when(
-    grepl("^Finished roofing", dwelling_roof) ~ "Yes",
-    grepl("^Natural roofing|^Rudimentary roofing|^No roof", dwelling_roof) ~ "No",
-    dwelling_roof == "Other (specify)" ~ "No",
+    grepl("^Finished roofing", dwelling_roof) ~ "No",
+    grepl("^Natural roofing|^Rudimentary roofing|^No roof", dwelling_roof) ~ "Yes",
+    dwelling_roof == "Other (specify)" ~ "Yes",
     TRUE ~ NA_character_
   ),
   roof = factor(roof, levels = c("No", "Yes")))
 # check
-table(MS$roof, useNA ="ifany")
-
-# hh.mobile
-table(NN$hh.mobile)
-table(MS$has_phone, useNA = "ifany")
-# recode to match PWS 
-MS <- MS %>%
-  mutate(hh.mobile = case_when(
-    has_phone == "Owns a phone" ~ "Yes",
-    has_phone == "Does not own a phone" ~ "No",
-    TRUE ~ NA_character_
-  ),
-  hh.mobile = factor(hh.mobile, levels = c("No", "Yes")))
-# check
-table(MS$hh.mobile, useNA = "ifany")
+table(MS$roof, MS$dwelling_roof, useNA ="ifany")
 
 # any.media.yn
 table(NN$any.media.yn) # no one variable that matches, have to recode q211-q213
@@ -287,16 +269,21 @@ MS <- MS %>%
 table(MS$partner.working.yn, useNA = "ifany")
 table(MS$partner.working.yn, MS$q1111, useNA = "ifany")
 
-# woman work (y/n)
+# woman work (y/n) (currently or worked in the past year or on leave/absent in NN)
 MS <- MS %>%
   mutate(working.yn = case_when(
-    q1112 == "Yes" ~ "Yes",
-    q1112 == "No" ~ "No",
+    employment_status == "Employed full-time" ~ "Yes",
+    employment_status == "Employed part-time" ~ "Yes",
+    employment_status == "Self-employed" ~ "Yes", 
+    employment_status == "Other: ____" ~ "No", 
+    employment_status == "Retired" ~ "No", 
+    employment_status == "Student" ~ "No", 
+    employment_status == "Unemployed" ~ "No",
     TRUE ~ NA_character_
   ),
   working.yn = factor(working.yn, levels = c("No", "Yes")))
 # check 
-table(MS$working.yn, useNA = "ifany")
+table(MS$employment_status,MS$working.yn,  useNA = "ifany")
 
 # cooking fuel (Woman's household uses clean fuels for cooking (electricity, liquefied petroleum gas (LPG), 
 # natural gas, or biogas)), NN = hh.clean.fuel, HH = q1114_6 (electricity), q1114_3 (LPG/natural gas)
@@ -484,16 +471,18 @@ table(MS$q217, MS$internet.use, useNA = "ifany")
 
 # mobile phone (woman)
 table(NN$has.mobile)
-table(MS$q214)
+table(MS$has_phone)
+# rename and recode to match PWS 
 MS <- MS %>%
   mutate(has.mobile = case_when(
-    q214 == "Yes" ~ "Yes",
-    q214 %in% c("No", "Don't know") ~ "No",
+    has_phone == "Owns a phone" ~ "Yes",
+    has_phone == "Does not own a phone" ~ "No",
     TRUE ~ NA_character_
   ),
   has.mobile = factor(has.mobile, levels = c("No", "Yes")))
-# check 
-table(MS$q214, MS$has.mobile, useNA = "ifany")
+# check
+table(MS$has.mobile, useNA = "ifany")
+
 
 # smartphone
 table(NN$smart.phone)
